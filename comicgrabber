@@ -1,0 +1,565 @@
+#!/usr/bin/php -qC
+<?
+// ComicGrabber Class {{{
+class ComicGrabber {
+	/**
+	* The Internal ID of the comic
+	* @var string
+	* @see __construct()
+	*/
+	var $_comicid;
+
+	/**
+	* The directory to search when looking for previous verions of the comic
+	* This defaults to $PWD/comicid
+	* @var string
+	* @see dir()
+	*/
+	var $_dir;
+
+	/**
+	* Filename to save to
+	* Determined by each variable inside square brackets
+	* Defaults to '[year][month][day].[ext]'
+	* @var string
+	*/
+	var $_filename;
+
+	/**
+	* The URL to start at when scanning
+	* @var string
+	* @see start()
+	*/
+	var $_start;
+
+	/**
+	* The base url to use for that sites comic
+	* This defaults to the _start variable unless a seperate call to base() is triggered
+	* @var string
+	* @see base
+	*/
+	var $_base;
+
+	/**
+	* Matching structure specification, array of arrays
+	* form: array(
+	* 	regular expression to match against,
+	*	variable to extract,
+	*	PHP expression to form when extracting,
+	* )
+	* @var array
+	* @see match()
+	*/
+	var $_matches;
+
+	/**
+	* Curl handler associated with this object
+	* @var object
+	*/
+	var $_curl;
+
+	/**
+	* Disabled indicator
+	* @var bool
+	* @see disable()
+	*/
+	var $_disabled;
+
+	/**
+	* Indicator that the date is not used when naming the file
+	* @var bool
+	* @see nodate()
+	*/
+	var $_nodate;
+
+	/**
+	* Indicator that not every page has to have a usable image
+	* @var bool
+	* @see ignore()
+	*/
+	var $_ignore;
+
+	/**
+	* The cutoff point when spanning mutliple pages
+	* The default is -1 which means when a matching file has been found
+	* Set to 0 for infinate (or until there is no more 'previous' matches)
+	* Set to anything else for a date e.g. '2009-01-01'
+	* @var int|string
+	* @see cutoff
+	*/
+	var $_cutoff;
+
+	/**
+	* The verbosity level
+	* @var int
+	* @see verbosity
+	*/
+	var $_verbosity;
+
+
+	/**
+	* Constructor unit
+	* @param $comicid string The Internal ID of the comic
+	*/
+	function __construct($comicid) {
+		$this->_comicid = $comicid;
+		$this->_curl = curl_init();
+		$this->_dir = getcwd() . "/$comicid";
+		$this->_filename = '[year][month][day].[ext]';
+		$this->_nodate = 0;
+		$this->_ignore = 0;
+		$this->_verbosity = 1;
+		$this->_cutoff = -1;
+		curl_setopt($this->_curl, CURLOPT_HEADER, FALSE);
+		curl_setopt($this->_curl, CURLOPT_AUTOREFERER, TRUE);
+		curl_setopt($this->_curl, CURLOPT_FOLLOWLOCATION, TRUE);
+	}
+
+	/**
+	* Object destructor
+	*/
+	function __destruct() {
+		curl_close($this->_curl);
+	}
+
+	// Helper functions {{{
+	/**
+	* Concatinate two URLs
+	* Code taken with thanks from http://nadeausoftware.com/articles/2008/05/php_tip_how_convert_relative_url_absolute_url
+	* @param string $baseUrl The base URL to use
+	* @param string $relativeUrl The secondary URL to concatinate to the base
+	* @return string The merged URL
+	*/
+	function _concat_url($baseUrl, $relativeUrl) {
+		// If relative URL has a scheme, clean path and return.
+		$r = $this->_split_url( $relativeUrl );
+		if ( $r === FALSE )
+			return FALSE;
+		if ( !empty( $r['scheme'] ) ) {
+			if ( !empty( $r['path'] ) && $r['path'][0] == '/' )
+				$r['path'] = $this->_url_remove_dot_segments( $r['path'] );
+			return $this->_join_url( $r );
+		}
+	 
+		// Make sure the base URL is absolute.
+		$b = $this->_split_url( $baseUrl );
+		if ( $b === FALSE || empty( $b['scheme'] ) || empty( $b['host'] ) )
+			return FALSE;
+		$r['scheme'] = $b['scheme'];
+	 
+		// If relative URL has an authority, clean path and return.
+		if ( isset( $r['host'] ) ) {
+			if ( !empty( $r['path'] ) )
+				$r['path'] = $this->_url_remove_dot_segments( $r['path'] );
+			return $this->_join_url( $r );
+		}
+		unset( $r['port'] );
+		unset( $r['user'] );
+		unset( $r['pass'] );
+	 
+		// Copy base authority.
+		$r['host'] = $b['host'];
+		if ( isset( $b['port'] ) ) $r['port'] = $b['port'];
+		if ( isset( $b['user'] ) ) $r['user'] = $b['user'];
+		if ( isset( $b['pass'] ) ) $r['pass'] = $b['pass'];
+		
+		// If relative URL has no path, use base path
+		if ( empty( $r['path'] ) ) {
+			if ( !empty( $b['path'] ) )
+				$r['path'] = $b['path'];
+			if ( !isset( $r['query'] ) && isset( $b['query'] ) )
+				$r['query'] = $b['query'];
+			return $this->_join_url( $r );
+		}
+	 
+		// If relative URL path doesn't start with /, merge with base path
+		if ( $r['path'][0] != '/'  && isset($b['path'])) {
+			$base = mb_strrchr( $b['path'], '/', TRUE, 'UTF-8' );
+			if ( $base === FALSE )
+				$base = '';
+			$r['path'] = $base . '/' . $r['path'];
+		}
+		$r['path'] = $this->_url_remove_dot_segments( $r['path'] );
+		return $this->_join_url( $r );
+	}
+
+	/**
+	* Removes the '.' and '..' parts of a URL
+	* @param $path The URL to process
+	* @return string The clean URL
+	*/
+	function _url_remove_dot_segments( $path ) {
+		// multi-byte character explode
+		$inSegs  = preg_split( '!/!u', $path );
+		$outSegs = array( );
+		foreach ( $inSegs as $seg )
+		{
+			if ( $seg == '' || $seg == '.')
+				continue;
+			if ( $seg == '..' ) {
+				array_pop( $outSegs );
+			} else
+				array_push( $outSegs, $seg );
+		}
+		$outPath = implode( '/', $outSegs );
+		if ( $path[0] == '/' )
+			$outPath = '/' . $outPath;
+		// compare last multi-byte character against '/'
+		if ( $outPath != '/' && (mb_strlen($path)-1) == mb_strrpos( $path, '/', 'UTF-8' ) )
+			$outPath .= '/';
+		return $outPath;
+	}
+
+	/**
+	* Split a URL into its component parts
+	* @param $url string The URL to process
+	* @param $decode bool Run the incomming URL though a decoder	
+	*/
+	function _split_url( $url, $decode=FALSE ) {
+	    $xunressub     = 'a-zA-Z\d\-._~\!$&\'()*+,;=';
+	    $xpchar        = $xunressub . ':@%';
+	    $xscheme       = '([a-zA-Z][a-zA-Z\d+-.]*)';
+	    $xuserinfo     = '((['  . $xunressub . '%]*)' .
+			     '(:([' . $xunressub . ':%]*))?)';
+	    $xipv4         = '(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})';
+	    $xipv6         = '(\[([a-fA-F\d.:]+)\])';
+	    $xhost_name    = '([a-zA-Z\d-.%]+)';
+	    $xhost         = '(' . $xhost_name . '|' . $xipv4 . '|' . $xipv6 . ')';
+	    $xport         = '(\d*)';
+	    $xauthority    = '((' . $xuserinfo . '@)?' . $xhost .
+			     '?(:' . $xport . ')?)';
+	    $xslash_seg    = '(/[' . $xpchar . ']*)';
+	    $xpath_authabs = '((//' . $xauthority . ')((/[' . $xpchar . ']*)*))';
+	    $xpath_rel     = '([' . $xpchar . ']+' . $xslash_seg . '*)';
+	    $xpath_abs     = '(/(' . $xpath_rel . ')?)';
+	    $xapath        = '(' . $xpath_authabs . '|' . $xpath_abs .
+			     '|' . $xpath_rel . ')';
+	    $xqueryfrag    = '([' . $xpchar . '/?' . ']*)';
+	    $xurl          = '^(' . $xscheme . ':)?' .  $xapath . '?' .
+			     '(\?' . $xqueryfrag . ')?(#' . $xqueryfrag . ')?$';
+	 
+	 
+	    // Split the URL into components.
+	    if ( !preg_match( '!' . $xurl . '!', $url, $m ) )
+		return FALSE;
+	 
+	    if ( !empty($m[2]) )        $parts['scheme']  = strtolower($m[2]);
+	 
+	    if ( !empty($m[7]) ) {
+		if ( isset( $m[9] ) )   $parts['user']    = $m[9];
+		else            $parts['user']    = '';
+	    }
+	    if ( !empty($m[10]) )       $parts['pass']    = $m[11];
+	 
+	    if ( !empty($m[13]) )       $h=$parts['host'] = $m[13];
+	    else if ( !empty($m[14]) )  $parts['host']    = $m[14];
+	    else if ( !empty($m[16]) )  $parts['host']    = $m[16];
+	    else if ( !empty( $m[5] ) ) $parts['host']    = '';
+	    if ( !empty($m[17]) )       $parts['port']    = $m[18];
+	 
+	    if ( !empty($m[19]) )       $parts['path']    = $m[19];
+	    else if ( !empty($m[21]) )  $parts['path']    = $m[21];
+	    else if ( !empty($m[25]) )  $parts['path']    = $m[25];
+	 
+	    if ( !empty($m[27]) )       $parts['query']   = $m[28];
+	    if ( !empty($m[29]) )       $parts['fragment']= $m[30];
+	 
+	    if ( !$decode )
+		return $parts;
+	    if ( !empty($parts['user']) )
+		$parts['user']     = rawurldecode( $parts['user'] );
+	    if ( !empty($parts['pass']) )
+		$parts['pass']     = rawurldecode( $parts['pass'] );
+	    if ( !empty($parts['path']) )
+		$parts['path']     = rawurldecode( $parts['path'] );
+	    if ( isset($h) )
+		$parts['host']     = rawurldecode( $parts['host'] );
+	    if ( !empty($parts['query']) )
+		$parts['query']    = rawurldecode( $parts['query'] );
+	    if ( !empty($parts['fragment']) )
+		$parts['fragment'] = rawurldecode( $parts['fragment'] );
+	    return $parts;
+	}
+
+	/**
+	* Reverse the split_url function
+	* @param $parts array The array of URL parts to rejoin
+	* @param $encode bool Encode the URL parts before returning
+	* @return string The rejoined URL
+	*/
+	function _join_url( $parts, $encode=FALSE ) {
+		if ( $encode ) {
+			if ( isset( $parts['user'] ) )
+				$parts['user']     = rawurlencode( $parts['user'] );
+			if ( isset( $parts['pass'] ) )
+				$parts['pass']     = rawurlencode( $parts['pass'] );
+			if ( isset( $parts['host'] ) && !preg_match( '!^(\[[\da-f.:]+\]])|([\da-f.:]+)$!ui', $parts['host'] ) )
+				$parts['host']     = rawurlencode( $parts['host'] );
+			if ( !empty( $parts['path'] ) )
+				$parts['path']     = preg_replace( '!%2F!ui', '/', rawurlencode( $parts['path'] ) );
+			if ( isset( $parts['query'] ) )
+			    $parts['query']    = rawurlencode( $parts['query'] );
+			if ( isset( $parts['fragment'] ) )
+			    $parts['fragment'] = rawurlencode( $parts['fragment'] );
+		}
+		
+		$url = '';
+		if ( !empty( $parts['scheme'] ) )
+			$url .= $parts['scheme'] . ':';
+		if ( isset( $parts['host'] ) ) {
+			$url .= '//';
+			if ( isset( $parts['user'] ) ) {
+				$url .= $parts['user'];
+				if ( isset( $parts['pass'] ) )
+				$url .= ':' . $parts['pass'];
+				$url .= '@';
+			}
+			if ( preg_match( '!^[\da-f]*:[\da-f.:]+$!ui', $parts['host'] ) )
+				$url .= '[' . $parts['host'] . ']'; // IPv6
+			else
+				$url .= $parts['host'];             // IPv4 or name
+			if ( isset( $parts['port'] ) )
+				$url .= ':' . $parts['port'];
+			if ( !empty( $parts['path'] ) && $parts['path'][0] != '/' )
+				$url .= '/';
+		}
+		if ( !empty( $parts['path'] ) )
+			$url .= $parts['path'];
+		if ( isset( $parts['query'] ) )
+			$url .= '?' . $parts['query'];
+		if ( isset( $parts['fragment'] ) )
+			$url .= '#' . $parts['fragment'];
+		return $url;
+	}
+	// End of Helper functions }}}
+
+	// Simple Setters / Getters {{{
+	/**
+	* Sets the directory to look in for previous comic versions
+	* @param $newdir string The dir to set
+	*/
+	function dir($newdir) {
+		$this->_dir = $newdir;
+	}
+
+	/**
+	* Sets the filename layout
+	* Default is [year]-[month]-[day].[ext]
+	* @param $format string The new filename format to set
+	*/
+	function filename($format) {
+		$this->_filename = $format;
+	}
+
+
+	/**
+	* Sets the starting URL
+	* @param $url string The URL to start scanning at
+	*/
+	function start($url) {
+		$this->_start = $url;
+		$this->_base = $url;
+	}
+
+	/**
+	* Quickly disables an instance so the grab() function fails silently
+	*/
+	function disable() {
+		$this->_disabled = TRUE;
+	}
+
+	/**
+	* Indicates that date is not used when calculating the filename. This simply indicates that date checks should be bypassed.
+	*/
+	function nodate() {
+		$this->_nodate = TRUE;
+	}
+
+	/**
+	* Specifies that not every page has to have an image.
+	* If none is found the previous page is used without quitting
+	*/
+	function ignore() {
+		$this->_ignore = TRUE;
+	}
+
+	/**
+	* The cutoff point when spanning mutliple pages
+	* The default is -1 which means when a matching file has been found
+	* Set to 0 for infinite (or until there is no more 'previous' matches)
+	* Set to anything else for a date e.g. '2009-01-01'
+	* @param int|string $date Either the numbers 0 or 1 or a date in Y-m-d format
+	*/
+	function cutoff($date) {
+		if ( ($date == 0) || ($date == 1) ) {
+			$this->_cutoff = $date;
+		} elseif (!preg_match('/[0-9]{4}-[0-9]{2}-[0-9]{2}/', $date)) {
+			die("Invalid date when setting cutoff '$date'. Date must be 0, 1 or in Y-m-d format");
+		} else
+			$this->_cutoff = $date;
+	}
+
+	/**
+	* Sets the verbosity level
+	* Default is '1'
+	* @param int $level The new verbosity level to set.
+	*/
+	function verbosity($level) {
+		$this->_verbosity = $level;
+	}
+
+	// End of Simple Setters / Getters }}}
+
+	/**
+	* Specify a matching regular expression to extract a variable
+	* Variables supported:
+	*	date		The date in Y-m-d Format
+	*	image		The image URL to extract (relative to $_start)
+	*	previous	The URL specifying the previous comic (relative to $_start)
+	*
+	* @param $var string The variable to extract. See above for valid variables
+	* @param $regexp string The regular expression complete with enclosures
+	* @param $format string Optional formatter. Defaults to first position captured. To capture second use '$m_2'.
+	*/
+	function match($var, $regexp, $format = '$m_1') {
+		$this->_matches[] = array(
+			$regexp,
+			$var,
+			$format,
+		);
+	}
+
+	/**
+	* Output text depending on the current log level
+	* @param $level int The verbosity level. 0 - Always, 10 - rarer
+	* @param $text string The text to output
+	*/
+	function _log($level, $text) {
+		if ($this->_verbosity >= $level)
+			echo $this->_comicid . "> $text\n";
+	}
+
+	/**
+	* Retrieve a webpage and optionally dump it to file
+	* @param $url string The URL to pull
+	* @param $file string|null Optional file name to dump to. If omitted the page content is returned by the function
+	*/
+	function _get($url, $file = null) {
+		curl_setopt($this->_curl, CURLOPT_URL, $url);
+		if ($file) {
+			$fh = fopen($file, 'w');
+			curl_setopt($this->_curl, CURLOPT_FILE, $fh); 
+			curl_exec($this->_curl);
+			fclose($fh);
+			// FIXME: Do some error checking here
+			return TRUE;
+		} else {
+			curl_setopt($this->_curl, CURLOPT_RETURNTRANSFER, TRUE);
+			return curl_exec($this->_curl);
+		}
+	}
+
+	/**
+	* Retrieves all missing comics from the _dir path using the regular expressions listed in _matches
+	*/
+	function grab() {
+		if ($this->_disabled) {
+			$this->_log(2, 'Disabled');
+			return;
+		}
+		$index = $this->_start;
+		$this->_log(1, 'Beginning grab...');
+		$downloaded = 0;
+		while (1) {
+			$getimg = 1;
+			$this->_log(2, "Downloading page '$index'");
+			$body = $this->_get($index);
+			$vars = array();
+			foreach ($this->_matches as $match) { # Extract all variables
+				$this->_log(4, "Attempt match for '{$match[1]}' with '{$match[0]}'");
+				if (preg_match('!' . $match[0] . '!is', $body, $matches)) {
+					extract($matches, EXTR_PREFIX_ALL, 'm');
+					eval('$out = "' . $match[2] . '";');
+					$this->_log(3, "Extracted '{$match[1]}' = '$out'");
+					$vars[$match[1]] = $out;	
+				} else {
+					$this->_log(2, "No matches for '{$match[1]}'");
+				}
+			}
+			if (!$this->_nodate && !$this->_ignore) { // Care about date?
+				if (!isset($vars['date'])) { // Process and check date
+					$this->_log(1, "Could not determine the date on page '$index'");
+					break;
+				} elseif (!preg_match('/[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}/', $vars['date'])) {
+					$this->_log(1, "Invalid date '{$vars['date']}' on page '$index'");
+					break;
+				}
+			}
+			if ($getimg && !isset($vars['image'])) { // Check image
+				if ($this->_ignore) {
+					$this->_log(1, "No image on page '$index'. Ignoring.");
+				} else {
+					$this->_log(1, "Could not find an image on page '$index'");
+					if ($this->_cutoff == -1)
+						break;
+				}
+			} elseif ($getimg) {
+				$vars['image'] = $this->_concat_url($this->_base, $vars['image']);
+				$vars['filename'] = pathinfo($vars['image'], PATHINFO_FILENAME);
+				$vars['ext'] = pathinfo($vars['image'], PATHINFO_EXTENSION);
+				if (isset($vars['date'])) {
+					$vars['epoc'] = strtotime($vars['date']);
+					$vars['year'] = date('Y', $vars['epoc']);
+					$vars['month'] = date('m', $vars['epoc']);
+					$vars['day'] = date('d', $vars['epoc']);
+				}
+				$blocks = array();
+				foreach ($vars as $key => $val)
+					$blocks["[$key]"] = $val;
+				$filename = $this->_dir . "/" . strtr($this->_filename, $blocks);
+
+				if (file_exists($filename)) {
+					$this->_log(2, "Found existing file '$filename'");
+					if ($this->_cutoff == -1) {
+						$this->_log(3, "Stopping grab.");
+						break;
+					}
+				} else {
+					$this->_log(1, "Downloading image {$vars['image']} -> $filename");
+					$this->_get($vars['image'], $filename);
+					if (isset($vars['epoc']) && $vars['epoc'])
+						touch($filename, $vars['epoc'], $vars['epoc']);
+					$downloaded++;
+				}
+			}
+			if ( ($this->_cutoff != 0) && ($this->_cutoff != -1) && ($this->_cutoff == $vars['date']) ) {
+				$this->_log(3, "Reached cutoff of {$this->_cutoff}, Stopping grab.");
+				break;
+			}
+			if (!isset($vars['previous'])) { // Check previous
+				$this->_log(1, "No 'previous' link could be found on page '$index'");
+				break;
+			} else {
+				$index = $this->_concat_url($this->_base, $vars['previous']);
+				// Drop though to next loop where index is now the previous page...
+			}
+		}
+		$this->_log(2, "Downloaded $downloaded comic" . ($downloaded == 1 ? '' : 's'));
+	}
+}
+// }}}
+include('settings.php');
+chdir(SAVE_DIR); // Where you want to stick pictures
+
+if (isset($_SERVER['argv']) && count($_SERVER['argv']) > 1) { // Specific requests
+	foreach (array_slice($_SERVER['argv'], 1) as $req)
+		if (file_exists($f = MODULE_DIR . "/$req.php")) {
+			require($f);
+		} else
+			echo "CORE> Module not found '$req'\n";
+} else { // Load everything
+	foreach (glob(MODULE_DIR . "/*.php") as $req) {
+		require($req);
+	}
+}
+echo "\nCORE>Done\n";

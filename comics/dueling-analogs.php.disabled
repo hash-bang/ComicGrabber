@@ -1,0 +1,9 @@
+<?
+$cg = new ComicGrabber('Dueling Analogs');
+$cg->verbosity(2);
+$cg->ignore();
+$cg->start('http://www.duelinganalogs.com');
+$cg->match('date', '<img src="http://www.duelinganalogs.com/comics/([0-9]{4}-[0-9]{2}-[0-9]{2})\.(jpg|gif|png)"');
+$cg->match('image', '<img src="(http://www.duelinganalogs.com/comics/.+?\.(?:jpg|gif|png))"');
+$cg->match('previous', '<li class="previous">.*?<a href="(.+?)".*?>.*?</a>.*?</li>');
+$cg->grab();
