@@ -451,6 +451,7 @@ class ComicGrabber {
 			curl_setopt($this->_curl, CURLOPT_FILE, $fh); 
 			curl_exec($this->_curl);
 			fclose($fh);
+			curl_setopt($this->_curl, CURLOPT_FILE, STDOUT); 
 			// FIXME: Do some error checking here
 			return TRUE;
 		} else {
